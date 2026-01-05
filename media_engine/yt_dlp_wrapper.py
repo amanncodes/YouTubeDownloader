@@ -9,18 +9,21 @@ from typing import Callable, Optional, Dict, Any
 
 import yt_dlp
 
+
 logger = logging.getLogger(__name__)
 
-class YtDlpError(Exception):
-    """
-    Base exception for yt-dlp wrapper errors.
-    """
 
-class MetadataextractionsError(YtDlpError):
+class YtDlpError(Exception):
+    """Base exception for yt-dlp wrapper errors."""
+
+
+class MetadataExtractionError(YtDlpError):
     pass
+
 
 class DownloadError(YtDlpError):
     pass
+
 
 class YtDlpEngine:
     """
@@ -28,16 +31,16 @@ class YtDlpEngine:
 
     - No Django dependency
     - No Celery dependency
-    - Safe for retires
+    - Safe for retries
     """
 
     def __init__(
-            self,
-            work_dir: str | Path,
-            proxy: Optional[str] = None,
-            cookie_file: Optional[str] = None,
-            user_agent: Optional[str] = None,
-            sleep_interval: int = 2,
+        self,
+        work_dir: str | Path,
+        proxy: Optional[str] = None,
+        cookie_file: Optional[str] = None,
+        user_agent: Optional[str] = None,
+        sleep_interval: int = 2,
     ):
         self.work_dir = Path(work_dir)
         self.work_dir.mkdir(parents=True, exist_ok=True)
@@ -62,20 +65,20 @@ class YtDlpEngine:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
                 return info
-        except Exceptions as e:
+        except Exception as exc:
             logger.exception("Metadata extraction failed")
-            raise MetadataExtractionError(str(e)) from e
+            raise MetadataExtractionError(str(exc)) from exc
 
     def download(
-            self,
-            url: str,
-            progress_callback: Optional[Calllable[[float], None]] = None,
+        self,
+        url: str,
+        progress_callback: Optional[Callable[[float], None]] = None,
     ) -> Dict[str, Any]:
         """
-        Download video + audio, merge amd return info dict
+        Download video + audio, merge, and return info dict.
 
         progress_callback:
-            Callable receiving progress percentage (0.00 - 100.0)
+            Callable receiving progress percentage (0.0 - 100.0)
         """
         output_id = uuid.uuid4().hex
         output_template = str(self.work_dir / f"{output_id}.%(ext)s")
@@ -97,15 +100,15 @@ class YtDlpEngine:
 
     # Internal helpers
     def _base_opts(
-            self,
-            *,
-            skip_download: bool,
-            outtmpl : Optional[str] = None,
-            write_info_json: bool = True,
-            progress_callback: Optional[Calable[[float], None]] = None,
+        self,
+        *,
+        skip_download: bool,
+        outtmpl: Optional[str] = None,
+        write_info_json: bool = True,
+        progress_callback: Optional[Callable[[float], None]] = None,
     ) -> Dict[str, Any]:
 
-        def _progress_hook(d: Dict[str: Any]):
+        def _progress_hook(d: Dict[str, Any]):
             if not progress_callback:
                 return
 
@@ -120,17 +123,17 @@ class YtDlpEngine:
             elif d.get("status") == "finished":
                 progress_callback(100.0)
 
-        opts: Dict[str: Any] = {
-            'quiet': True,
-            'no_warnings': True,
-            'skip_download': skip_download,
-            'format': 'bestvideo+bestaudio/best',
-            'merge_output_format': 'mp4',
-            'sleep_interval': self.sleep_interval,
-            'retries': 3,
-            'fragment_retres': 3,
-            'noplaylist': True,
-            'progress_hooks': [_progress_hook],
+        opts: Dict[str, Any] = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": skip_download,
+            "format": "bestvideo+bestaudio/best",
+            "merge_output_format": "mp4",
+            "sleep_interval": self.sleep_interval,
+            "retries": 3,
+            "fragment_retries": 3,
+            "noplaylist": True,
+            "progress_hooks": [_progress_hook],
         }
 
         if outtmpl:
@@ -141,6 +144,9 @@ class YtDlpEngine:
 
         if self.proxy:
             opts["proxy"] = self.proxy
+
+        if self.cookie_file:
+            opts["cookiefile"] = self.cookie_file
 
         if self.user_agent:
             opts["user_agent"] = self.user_agent
