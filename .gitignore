@@ -1,11 +1,13 @@
-venv/
-__pycache__/
-*.pyc
-.env
-*.log
+# Runtime artifacts
 tmp_downloads/
-media/
+media_files/
 static/
-.idea/
 db.sqlite3
 
+# Python
+__pycache__/
+*.pyc
+
+# Env
+venv/
+.env
