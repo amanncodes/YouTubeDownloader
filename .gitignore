@@ -1,7 +1,11 @@
 venv/
 __pycache__/
+*.pyc
 .env
 *.log
+tmp_downloads/
 media/
 static/
 .idea/
+db.sqlite3
+
