@@ -78,6 +78,8 @@ def process_download_job(self, job_id: str):
 
         # Acquire identity
         proxy = PROXY_POOL.get_proxy(proxy_type="datacenter")
+        if proxy is None:
+            logger.warning("No healthy proxy available, falling back to direct connection")
         cookie_path = COOKIE_VAULT.get_cookie()
 
         logger.info(
@@ -143,17 +145,46 @@ def process_download_job(self, job_id: str):
 
     # Controlled failures
     except MetadataExtractionError as exc:
-        logger.exception("Metadata extraction failed for job %s", job.id)
+        reason = str(exc)
 
-        if proxy:
-            PROXY_POOL.report_failure(proxy)
-        if cookie_path:
-            COOKIE_VAULT.report_failure(cookie_path)
+        logger.warning(
+            "Metadata extraction issue for job %s: %s",
+            job.id,
+            reason,
+        )
 
+        # Cookie failure → retry without cookies
+        if reason == "COOKIE_INVALID":
+            if cookie_path:
+                COOKIE_VAULT.report_failure(cookie_path)
+
+            logger.warning(
+                "Retrying job %s without cookies",
+                job.id,
+            )
+
+            # Retry the task (next run will skip cookies)
+            raise self.retry(exc=exc)
+
+        # Proxy failure → retry without proxy
+        if reason == "PROXY_FAILED":
+            if proxy:
+                PROXY_POOL.report_failure(proxy)
+
+            logger.warning(
+                "Retrying job %s without proxy",
+                job.id,
+            )
+
+            # Retry the task (next run will skip proxy)
+            raise self.retry(exc=exc)
+
+        # Real metadata failure
         job.mark_failed(
             error_code="METADATA_EXTRACTION_FAILED",
-            error_message=str(exc),
+            error_message=reason,
         )
+
 
     except DownloadError as exc:
         logger.exception("Download failed for job %s", job.id)
@@ -172,6 +203,7 @@ def process_download_job(self, job_id: str):
                 error_code="DOWNLOAD_FAILED",
                 error_message=str(exc),
             )
+
 
     # Unexpected failures
     except Exception as exc:
