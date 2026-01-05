@@ -42,31 +42,66 @@ class YtDlpEngine:
         user_agent: Optional[str] = None,
         sleep_interval: int = 2,
     ):
+        # Working directory
         self.work_dir = Path(work_dir)
         self.work_dir.mkdir(parents=True, exist_ok=True)
 
-        self.proxy = proxy
-        self.cookie_file = cookie_file
-        self.user_agent = user_agent
-        self.sleep_interval = sleep_interval
+        # Proxy (optional)
+        self.proxy = proxy or None
 
+        # Cookie file (optional, validated)
+        self.cookie_file = None
+        if cookie_file:
+            try:
+                cookie_path = Path(cookie_file)
+                if cookie_path.exists() and cookie_path.stat().st_size > 0:
+                    self.cookie_file = str(cookie_path)
+            except Exception:
+                # Any issue → ignore cookies safely
+                self.cookie_file = None
+
+        # User agent (optional)
+        self.user_agent = user_agent
+
+        # Throttling
+        self.sleep_interval = sleep_interval
 
     # Public API
     def extract_metadata(self, url: str) -> Dict[str, Any]:
         """
         Extract metadata ONLY (no download).
+
+        Cookies and proxies are treated as optional optimizations.
         """
         ydl_opts = self._base_opts(
             skip_download=True,
-            write_info_json=False
+            write_info_json=False,
         )
 
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
                 return info
-        except Exception as exc:
+
+        except yt_dlp.utils.DownloadError as exc:
+            msg = str(exc).lower()
+
+            # Cookie-related failures
+            if "cookie" in msg:
+                logger.warning("Cookie error during metadata extraction")
+                raise MetadataExtractionError("COOKIE_INVALID") from exc
+
+            # Proxy / connection issues
+            if any(k in msg for k in ("proxy", "connection", "timed out", "timeout")):
+                logger.warning("Proxy or network error during metadata extraction")
+                raise MetadataExtractionError("PROXY_FAILED") from exc
+
+            # Real extraction failures
             logger.exception("Metadata extraction failed")
+            raise MetadataExtractionError(str(exc)) from exc
+
+        except Exception as exc:
+            logger.exception("Unexpected metadata extraction error")
             raise MetadataExtractionError(str(exc)) from exc
 
     def download(
