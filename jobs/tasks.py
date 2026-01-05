@@ -22,7 +22,6 @@ from infrastructure.cookie_vault import CookieVault
 logger = logging.getLogger(__name__)
 channel_layer = get_channel_layer()
 
-
 # Infrastructure (worker-local singletons)
 PROXY_POOL = ProxyPool(
     proxies=[
@@ -126,6 +125,7 @@ def process_download_job(self, job_id: str):
     cookie_path = None
 
     try:
+        # Acquire identity
         proxy = PROXY_POOL.get_proxy(proxy_type="datacenter")
         cookie_path = COOKIE_VAULT.get_cookie()
 
@@ -135,6 +135,7 @@ def process_download_job(self, job_id: str):
             cookie_file=str(cookie_path) if cookie_path else None,
         )
 
+        # Metadata
         metadata = engine.extract_metadata(job.source_url)
         youtube_id = metadata.get("id")
 
@@ -155,6 +156,7 @@ def process_download_job(self, job_id: str):
 
         job.update_status(JobStatus.DOWNLOADING)
 
+        # Progress hook
         def on_progress(percent: float):
             job.update_progress(percent)
 
@@ -173,11 +175,13 @@ def process_download_job(self, job_id: str):
             if job.parent:
                 job.parent.recompute_parent_progress()
 
+        # Download
         engine.download(
             job.source_url,
             progress_callback=on_progress,
         )
 
+        # Success handling
         if proxy:
             PROXY_POOL.report_success(proxy)
         if cookie_path:
@@ -193,6 +197,7 @@ def process_download_job(self, job_id: str):
                     "job_id": str(job.id),
                     "status": JobStatus.COMPLETED,
                     "progress": 100.0,
+                    "terminal": True,
                 },
             },
         )
@@ -200,6 +205,7 @@ def process_download_job(self, job_id: str):
         if job.parent:
             job.parent.recompute_parent_progress()
 
+    # Controlled failures
     except MetadataExtractionError as exc:
         reason = str(exc)
 
@@ -211,14 +217,29 @@ def process_download_job(self, job_id: str):
             COOKIE_VAULT.report_failure(cookie_path)
             raise self.retry(exc=exc)
 
+        async_to_sync(channel_layer.group_send)(
+            f"job_{job.id}",
+            {
+                "type": "job_progress",
+                "data": {
+                    "job_id": str(job.id),
+                    "status": JobStatus.FAILED,
+                    "progress": job.progress_percentage,
+                    "terminal": True,
+                },
+            },
+        )
+
         job.mark_failed(
             error_code="METADATA_EXTRACTION_FAILED",
             error_message=reason,
         )
 
     except DownloadError:
-        raise  # handled by autoretry_for
+        # handled by autoretry_for
+        raise
 
+    # Unexpected failures
     except Exception as exc:
         logger.exception("Unexpected failure for job %s", job.id)
 
@@ -226,6 +247,19 @@ def process_download_job(self, job_id: str):
             PROXY_POOL.report_failure(proxy)
         if cookie_path:
             COOKIE_VAULT.report_failure(cookie_path)
+
+        async_to_sync(channel_layer.group_send)(
+            f"job_{job.id}",
+            {
+                "type": "job_progress",
+                "data": {
+                    "job_id": str(job.id),
+                    "status": JobStatus.FAILED,
+                    "progress": job.progress_percentage,
+                    "terminal": True,
+                },
+            },
+        )
 
         job.mark_failed(
             error_code="UNEXPECTED_ERROR",
