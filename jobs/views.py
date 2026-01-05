@@ -6,7 +6,8 @@ from jobs.serializers import (
     DownloadJobCreateSerializer,
     DownloadJobSerializer,
 )
-from jobs.tasks import process_download_job
+
+from jobs.tasks import process_download_job, process_collection_job
 
 
 class DownloadJobCreateAPIView(generics.CreateAPIView):
@@ -19,8 +20,10 @@ class DownloadJobCreateAPIView(generics.CreateAPIView):
 
         job = serializer.save(status="PENDING")
 
-        # Enqueue async processing
-        process_download_job.delay(str(job.id))
+        if job.job_type in ("PLAYLIST", "CHANNEL"):
+            process_collection_job.delay(str(job.id))
+        else:
+            process_download_job.delay(str(job.id))
 
         return Response(
             DownloadJobSerializer(job).data,
