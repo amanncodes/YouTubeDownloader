@@ -44,6 +44,7 @@ INSTALLED_APPS = [
     "rest_framework",
 
     "jobs",
+    "media",
     "media_engine",
     "infrastructure",
 ]
