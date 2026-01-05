@@ -6,6 +6,8 @@ from django.db import transaction
 
 from jobs.models import DownloadJob, JobStatus
 from media.models import VideoMetadata
+from media_engine.discovery import DiscoveryEngine
+
 from media_engine.yt_dlp_wrapper import (
     YtDlpEngine,
     MetadataExtractionError,
@@ -37,15 +39,64 @@ COOKIE_VAULT = CookieVault(
     cooldown_seconds=600,
 )
 
-# Celery task
-@shared_task(
-    bind=True,
-    acks_late=True,
-    autoretry_for=(DownloadError,),
-    retry_backoff=True,
-    retry_jitter=True,
-    retry_kwargs={"max_retries": 3},
-)
+# COLLECTION TASK (PLAYLIST / CHANNEL FAN-OUT)
+@shared_task(bind=True, acks_late=True)
+def process_collection_job(self, parent_job_id: str):
+    """
+    Fan-out a PLAYLIST or CHANNEL job into child VIDEO jobs.
+    """
+    try:
+        parent = DownloadJob.objects.get(id=parent_job_id)
+    except DownloadJob.DoesNotExist:
+        logger.warning("Parent job %s does not exist", parent_job_id)
+        return
+
+    if parent.status != JobStatus.PENDING:
+        logger.info("Parent job %s already processed", parent.id)
+        return
+
+    parent.update_status(JobStatus.DISCOVERING)
+
+    try:
+        video_urls = DiscoveryEngine.extract_video_urls(parent.source_url)
+    except Exception as exc:
+        parent.mark_failed(
+            error_code="DISCOVERY_FAILED",
+            error_message=str(exc),
+        )
+        return
+
+    if not video_urls:
+        parent.mark_failed(
+            error_code="EMPTY_COLLECTION",
+            error_message="No videos found",
+        )
+        return
+
+    children = []
+    for url in video_urls:
+        child = DownloadJob.objects.create(
+            job_type="VIDEO",
+            source_url=url,
+            parent=parent,
+        )
+        children.append(child)
+
+    parent.total_children = len(children)
+    parent.update_status(JobStatus.DOWNLOADING)
+    parent.save(update_fields=["total_children", "status"])
+
+    for child in children:
+        process_download_job.delay(str(child.id))
+
+    logger.info(
+        "Parent job %s spawned %d child jobs",
+        parent.id,
+        len(children),
+    )
+
+# VIDEO DOWNLOAD TASK
+@shared_task(bind=True, acks_late=True)
 def process_download_job(self, job_id: str):
     """
     Execute a DownloadJob safely with proxy + cookie rotation.
@@ -62,7 +113,6 @@ def process_download_job(self, job_id: str):
         logger.warning("Job %s does not exist", job_id)
         return
 
-    # Guard against duplicate execution
     if job.status in {JobStatus.COMPLETED, JobStatus.FAILED}:
         logger.info("Job %s already finished (%s)", job.id, job.status)
         return
@@ -76,10 +126,11 @@ def process_download_job(self, job_id: str):
             job.mark_started()
             job.update_status(JobStatus.FETCHING_METADATA)
 
-        # Acquire identity
+        # Acquire identity (optional)
         proxy = PROXY_POOL.get_proxy(proxy_type="datacenter")
         if proxy is None:
-            logger.warning("No healthy proxy available, falling back to direct connection")
+            logger.warning("No healthy proxy available, using direct connection")
+
         cookie_path = COOKIE_VAULT.get_cookie()
 
         logger.info(
@@ -97,8 +148,6 @@ def process_download_job(self, job_id: str):
 
         # Metadata extraction
         metadata = engine.extract_metadata(job.source_url)
-
-        # Persist metadata (idempotent)
         youtube_id = metadata.get("id")
 
         VideoMetadata.objects.update_or_create(
@@ -116,7 +165,7 @@ def process_download_job(self, job_id: str):
             },
         )
 
-        # Download with progress hook
+        # Download with progress reporting
         def on_progress(percent: float):
             job.update_progress(percent)
             if job.parent:
@@ -129,7 +178,7 @@ def process_download_job(self, job_id: str):
             progress_callback=on_progress,
         )
 
-        # Success reporting
+        # Success handling
         if proxy:
             PROXY_POOL.report_success(proxy)
 
@@ -153,38 +202,20 @@ def process_download_job(self, job_id: str):
             reason,
         )
 
-        # Cookie failure → retry without cookies
         if reason == "COOKIE_INVALID":
             if cookie_path:
                 COOKIE_VAULT.report_failure(cookie_path)
-
-            logger.warning(
-                "Retrying job %s without cookies",
-                job.id,
-            )
-
-            # Retry the task (next run will skip cookies)
             raise self.retry(exc=exc)
 
-        # Proxy failure → retry without proxy
         if reason == "PROXY_FAILED":
             if proxy:
                 PROXY_POOL.report_failure(proxy)
-
-            logger.warning(
-                "Retrying job %s without proxy",
-                job.id,
-            )
-
-            # Retry the task (next run will skip proxy)
             raise self.retry(exc=exc)
 
-        # Real metadata failure
         job.mark_failed(
             error_code="METADATA_EXTRACTION_FAILED",
             error_message=reason,
         )
-
 
     except DownloadError as exc:
         logger.exception("Download failed for job %s", job.id)
@@ -203,7 +234,6 @@ def process_download_job(self, job_id: str):
                 error_code="DOWNLOAD_FAILED",
                 error_message=str(exc),
             )
-
 
     # Unexpected failures
     except Exception as exc:
