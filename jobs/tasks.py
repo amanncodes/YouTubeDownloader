@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import logging
+
 from celery import shared_task
 from django.db import transaction
+
+from asgiref.sync import async_to_sync
+from channels.layers import get_channel_layer
 
 from jobs.models import DownloadJob, JobStatus
 from media.models import VideoMetadata
 from media_engine.discovery import DiscoveryEngine
-
 from media_engine.yt_dlp_wrapper import (
     YtDlpEngine,
     MetadataExtractionError,
@@ -17,11 +20,12 @@ from infrastructure.proxy_pool import Proxy, ProxyPool
 from infrastructure.cookie_vault import CookieVault
 
 logger = logging.getLogger(__name__)
+channel_layer = get_channel_layer()
+
 
 # Infrastructure (worker-local singletons)
 PROXY_POOL = ProxyPool(
     proxies=[
-        # TODO: Replace with DB-backed proxies later
         Proxy("http://1.2.3.4:8000", "datacenter"),
         Proxy("http://5.6.7.8:8000", "residential"),
     ],
@@ -31,7 +35,6 @@ PROXY_POOL = ProxyPool(
 
 COOKIE_VAULT = CookieVault(
     cookie_files=[
-        # TODO: Replace with real cookies.txt paths
         "cookies/a.txt",
         "cookies/b.txt",
     ],
@@ -39,12 +42,9 @@ COOKIE_VAULT = CookieVault(
     cooldown_seconds=600,
 )
 
-# COLLECTION TASK (PLAYLIST / CHANNEL FAN-OUT)
+# COLLECTION TASK (playlist / channel fan-out)
 @shared_task(bind=True, acks_late=True)
 def process_collection_job(self, parent_job_id: str):
-    """
-    Fan-out a PLAYLIST or CHANNEL job into child VIDEO jobs.
-    """
     try:
         parent = DownloadJob.objects.get(id=parent_job_id)
     except DownloadJob.DoesNotExist:
@@ -52,7 +52,6 @@ def process_collection_job(self, parent_job_id: str):
         return
 
     if parent.status != JobStatus.PENDING:
-        logger.info("Parent job %s already processed", parent.id)
         return
 
     parent.update_status(JobStatus.DISCOVERING)
@@ -73,14 +72,14 @@ def process_collection_job(self, parent_job_id: str):
         )
         return
 
-    children = []
-    for url in video_urls:
-        child = DownloadJob.objects.create(
+    children = [
+        DownloadJob.objects.create(
             job_type="VIDEO",
             source_url=url,
             parent=parent,
         )
-        children.append(child)
+        for url in video_urls
+    ]
 
     parent.total_children = len(children)
     parent.update_status(JobStatus.DOWNLOADING)
@@ -96,49 +95,39 @@ def process_collection_job(self, parent_job_id: str):
     )
 
 # VIDEO DOWNLOAD TASK
-@shared_task(bind=True, acks_late=True)
+@shared_task(
+    bind=True,
+    acks_late=True,
+    autoretry_for=(DownloadError,),
+    retry_backoff=True,
+    retry_jitter=True,
+    retry_kwargs={"max_retries": 3},
+)
 def process_download_job(self, job_id: str):
-    """
-    Execute a DownloadJob safely with proxy + cookie rotation.
-
-    This task is:
-    - idempotent
-    - retry-safe
-    - crash-safe
-    """
-
     try:
-        job = DownloadJob.objects.select_for_update().get(id=job_id)
+        with transaction.atomic():
+            job = (
+                DownloadJob.objects
+                .select_for_update()
+                .get(id=job_id)
+            )
+
+            if job.status in {JobStatus.COMPLETED, JobStatus.FAILED}:
+                return
+
+            job.mark_started()
+            job.update_status(JobStatus.FETCHING_METADATA)
+
     except DownloadJob.DoesNotExist:
         logger.warning("Job %s does not exist", job_id)
         return
 
-    if job.status in {JobStatus.COMPLETED, JobStatus.FAILED}:
-        logger.info("Job %s already finished (%s)", job.id, job.status)
-        return
-
-    proxy: str | None = None
+    proxy = None
     cookie_path = None
 
     try:
-        # Start job
-        with transaction.atomic():
-            job.mark_started()
-            job.update_status(JobStatus.FETCHING_METADATA)
-
-        # Acquire identity (optional)
         proxy = PROXY_POOL.get_proxy(proxy_type="datacenter")
-        if proxy is None:
-            logger.warning("No healthy proxy available, using direct connection")
-
         cookie_path = COOKIE_VAULT.get_cookie()
-
-        logger.info(
-            "Job %s using proxy=%s cookie=%s",
-            job.id,
-            proxy,
-            cookie_path,
-        )
 
         engine = YtDlpEngine(
             work_dir="tmp_downloads",
@@ -146,7 +135,6 @@ def process_download_job(self, job_id: str):
             cookie_file=str(cookie_path) if cookie_path else None,
         )
 
-        # Metadata extraction
         metadata = engine.extract_metadata(job.source_url)
         youtube_id = metadata.get("id")
 
@@ -165,51 +153,62 @@ def process_download_job(self, job_id: str):
             },
         )
 
-        # Download with progress reporting
+        job.update_status(JobStatus.DOWNLOADING)
+
         def on_progress(percent: float):
             job.update_progress(percent)
+
+            async_to_sync(channel_layer.group_send)(
+                f"job_{job.id}",
+                {
+                    "type": "job_progress",
+                    "data": {
+                        "job_id": str(job.id),
+                        "status": JobStatus.DOWNLOADING,
+                        "progress": percent,
+                    },
+                },
+            )
+
             if job.parent:
                 job.parent.recompute_parent_progress()
-
-        job.update_status(JobStatus.DOWNLOADING)
 
         engine.download(
             job.source_url,
             progress_callback=on_progress,
         )
 
-        # Success handling
         if proxy:
             PROXY_POOL.report_success(proxy)
-
         if cookie_path:
             COOKIE_VAULT.report_success(cookie_path)
 
         job.mark_completed()
 
+        async_to_sync(channel_layer.group_send)(
+            f"job_{job.id}",
+            {
+                "type": "job_progress",
+                "data": {
+                    "job_id": str(job.id),
+                    "status": JobStatus.COMPLETED,
+                    "progress": 100.0,
+                },
+            },
+        )
+
         if job.parent:
             job.parent.recompute_parent_progress()
 
-        logger.info("Job %s completed successfully", job.id)
-
-    # Controlled failures
     except MetadataExtractionError as exc:
         reason = str(exc)
 
-        logger.warning(
-            "Metadata extraction issue for job %s: %s",
-            job.id,
-            reason,
-        )
-
-        if reason == "COOKIE_INVALID":
-            if cookie_path:
-                COOKIE_VAULT.report_failure(cookie_path)
+        if reason == "PROXY_FAILED" and proxy:
+            PROXY_POOL.report_failure(proxy)
             raise self.retry(exc=exc)
 
-        if reason == "PROXY_FAILED":
-            if proxy:
-                PROXY_POOL.report_failure(proxy)
+        if reason == "COOKIE_INVALID" and cookie_path:
+            COOKIE_VAULT.report_failure(cookie_path)
             raise self.retry(exc=exc)
 
         job.mark_failed(
@@ -217,27 +216,11 @@ def process_download_job(self, job_id: str):
             error_message=reason,
         )
 
-    except DownloadError as exc:
-        logger.exception("Download failed for job %s", job.id)
+    except DownloadError:
+        raise  # handled by autoretry_for
 
-        if proxy:
-            PROXY_POOL.report_failure(proxy)
-        if cookie_path:
-            COOKIE_VAULT.report_failure(cookie_path)
-
-        job.increment_retry()
-
-        if job.can_retry():
-            raise self.retry(exc=exc)
-        else:
-            job.mark_failed(
-                error_code="DOWNLOAD_FAILED",
-                error_message=str(exc),
-            )
-
-    # Unexpected failures
     except Exception as exc:
-        logger.exception("Unexpected error for job %s", job.id)
+        logger.exception("Unexpected failure for job %s", job.id)
 
         if proxy:
             PROXY_POOL.report_failure(proxy)
