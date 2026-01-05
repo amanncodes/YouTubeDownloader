@@ -5,6 +5,7 @@ from celery import shared_task
 from django.db import transaction
 
 from jobs.models import DownloadJob, JobStatus
+from media.models import VideoMetadata
 from media_engine.yt_dlp_wrapper import (
     YtDlpEngine,
     MetadataExtractionError,
@@ -93,7 +94,25 @@ def process_download_job(self, job_id: str):
         )
 
         # Metadata extraction
-        engine.extract_metadata(job.source_url)
+        metadata = engine.extract_metadata(job.source_url)
+
+        # Persist metadata (idempotent)
+        youtube_id = metadata.get("id")
+
+        VideoMetadata.objects.update_or_create(
+            youtube_id=youtube_id,
+            defaults={
+                "job": job,
+                "title": metadata.get("title"),
+                "channel_id": metadata.get("channel_id"),
+                "channel_name": metadata.get("uploader"),
+                "duration_seconds": metadata.get("duration"),
+                "upload_date": metadata.get("upload_date"),
+                "view_count": metadata.get("view_count"),
+                "like_count": metadata.get("like_count"),
+                "raw_metadata": metadata,
+            },
+        )
 
         # Download with progress hook
         def on_progress(percent: float):
