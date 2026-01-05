@@ -10,10 +10,33 @@ from media_engine.yt_dlp_wrapper import (
     MetadataExtractionError,
     DownloadError,
 )
+from infrastructure.proxy_pool import Proxy, ProxyPool
+from infrastructure.cookie_vault import CookieVault
 
 logger = logging.getLogger(__name__)
 
+# Infrastructure (worker-local singletons)
+PROXY_POOL = ProxyPool(
+    proxies=[
+        # TODO: Replace with DB-backed proxies later
+        Proxy("http://1.2.3.4:8000", "datacenter"),
+        Proxy("http://5.6.7.8:8000", "residential"),
+    ],
+    max_failures=3,
+    cooldown_seconds=300,
+)
 
+COOKIE_VAULT = CookieVault(
+    cookie_files=[
+        # TODO: Replace with real cookies.txt paths
+        "cookies/a.txt",
+        "cookies/b.txt",
+    ],
+    max_failures=2,
+    cooldown_seconds=600,
+)
+
+# Celery task
 @shared_task(
     bind=True,
     acks_late=True,
@@ -24,33 +47,53 @@ logger = logging.getLogger(__name__)
 )
 def process_download_job(self, job_id: str):
     """
-    Execute a DownloadJob safely.
+    Execute a DownloadJob safely with proxy + cookie rotation.
 
-    This task is idempotent and retry-safe.
+    This task is:
+    - idempotent
+    - retry-safe
+    - crash-safe
     """
+
     try:
         job = DownloadJob.objects.select_for_update().get(id=job_id)
     except DownloadJob.DoesNotExist:
-        logger.warning("Job %s no longer exists", job_id)
+        logger.warning("Job %s does not exist", job_id)
         return
 
     # Guard against duplicate execution
     if job.status in {JobStatus.COMPLETED, JobStatus.FAILED}:
-        logger.info("Job %s already terminal (%s)", job.id, job.status)
+        logger.info("Job %s already finished (%s)", job.id, job.status)
         return
 
+    proxy: str | None = None
+    cookie_path = None
+
     try:
+        # Start job
         with transaction.atomic():
-            job.update_status(JobStatus.FETCHING_METADATA)
             job.mark_started()
+            job.update_status(JobStatus.FETCHING_METADATA)
+
+        # Acquire identity
+        proxy = PROXY_POOL.get_proxy(proxy_type="datacenter")
+        cookie_path = COOKIE_VAULT.get_cookie()
+
+        logger.info(
+            "Job %s using proxy=%s cookie=%s",
+            job.id,
+            proxy,
+            cookie_path,
+        )
 
         engine = YtDlpEngine(
             work_dir="tmp_downloads",
+            proxy=proxy,
+            cookie_file=str(cookie_path) if cookie_path else None,
         )
 
-
         # Metadata extraction
-        metadata = engine.extract_metadata(job.source_url)
+        engine.extract_metadata(job.source_url)
 
         # Download with progress hook
         def on_progress(percent: float):
@@ -65,8 +108,13 @@ def process_download_job(self, job_id: str):
             progress_callback=on_progress,
         )
 
+        # Success reporting
+        if proxy:
+            PROXY_POOL.report_success(proxy)
 
-        # Finalize
+        if cookie_path:
+            COOKIE_VAULT.report_success(cookie_path)
+
         job.mark_completed()
 
         if job.parent:
@@ -74,8 +122,15 @@ def process_download_job(self, job_id: str):
 
         logger.info("Job %s completed successfully", job.id)
 
+    # Controlled failures
     except MetadataExtractionError as exc:
         logger.exception("Metadata extraction failed for job %s", job.id)
+
+        if proxy:
+            PROXY_POOL.report_failure(proxy)
+        if cookie_path:
+            COOKIE_VAULT.report_failure(cookie_path)
+
         job.mark_failed(
             error_code="METADATA_EXTRACTION_FAILED",
             error_message=str(exc),
@@ -83,6 +138,11 @@ def process_download_job(self, job_id: str):
 
     except DownloadError as exc:
         logger.exception("Download failed for job %s", job.id)
+
+        if proxy:
+            PROXY_POOL.report_failure(proxy)
+        if cookie_path:
+            COOKIE_VAULT.report_failure(cookie_path)
 
         job.increment_retry()
 
@@ -94,8 +154,15 @@ def process_download_job(self, job_id: str):
                 error_message=str(exc),
             )
 
+    # Unexpected failures
     except Exception as exc:
         logger.exception("Unexpected error for job %s", job.id)
+
+        if proxy:
+            PROXY_POOL.report_failure(proxy)
+        if cookie_path:
+            COOKIE_VAULT.report_failure(cookie_path)
+
         job.mark_failed(
             error_code="UNEXPECTED_ERROR",
             error_message=str(exc),
