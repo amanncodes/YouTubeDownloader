@@ -4,6 +4,7 @@ import os
 import json
 import uuid
 import logging
+import shutil
 from pathlib import Path
 from typing import Callable, Optional, Dict, Any
 
@@ -42,7 +43,7 @@ class YtDlpEngine:
         user_agent: Optional[str] = None,
         sleep_interval: int = 2,
     ):
-        # Working directory
+        # Working directory (job-scoped)
         self.work_dir = Path(work_dir)
         self.work_dir.mkdir(parents=True, exist_ok=True)
 
@@ -67,6 +68,7 @@ class YtDlpEngine:
         self.sleep_interval = sleep_interval
 
     # Public API
+
     def extract_metadata(self, url: str) -> Dict[str, Any]:
         """
         Extract metadata ONLY (no download).
@@ -121,7 +123,7 @@ class YtDlpEngine:
         ydl_opts = self._base_opts(
             skip_download=False,
             outtmpl=output_template,
-            progress_callback=progress_callback
+            progress_callback=progress_callback,
         )
 
         try:
@@ -132,8 +134,32 @@ class YtDlpEngine:
             logger.exception("Download failed")
             raise DownloadError(str(exc)) from exc
 
+    def cleanup_partial_files(self) -> None:
+        """
+        Remove partial / temporary files created by yt-dlp or ffmpeg.
+
+        Safe to call multiple times.
+        Never touches completed files.
+        """
+        if not self.work_dir.exists():
+            return
+
+        for path in self.work_dir.iterdir():
+            if path.suffix in {".part", ".ytdl", ".temp"}:
+                try:
+                    path.unlink()
+                except Exception:
+                    pass
+
+        # Optional: remove empty directory
+        try:
+            if not any(self.work_dir.iterdir()):
+                shutil.rmtree(self.work_dir, ignore_errors=True)
+        except Exception:
+            pass
 
     # Internal helpers
+
     def _base_opts(
         self,
         *,
