@@ -45,8 +45,18 @@ def get_retry_metadata(job: DownloadJob) -> dict:
         "retry_count": job.retry_count,
         "max_retries": job.MAX_RETRIES,
         # Hint for UI – approximate Celery backoff
-        "retry_after_seconds": (2 ** job.retry_count) if job.can_retry() else None,
+        "retry_after_seconds": (2 ** job.retry_count)
+        if job.can_retry()
+        else None,
     }
+
+
+def is_cancelled(job_id: str) -> bool:
+    return (
+        DownloadJob.objects
+        .filter(id=job_id, status=JobStatus.CANCELLED)
+        .exists()
+    )
 
 # Infrastructure (worker-local singletons)
 PROXY_POOL = ProxyPool(
@@ -137,7 +147,11 @@ def process_download_job(self, job_id: str):
                 .get(id=job_id)
             )
 
-            if job.status in {JobStatus.COMPLETED, JobStatus.FAILED}:
+            if job.status in {
+                JobStatus.COMPLETED,
+                JobStatus.FAILED,
+                JobStatus.CANCELLED,
+            }:
                 return
 
             job.mark_started()
@@ -145,6 +159,11 @@ def process_download_job(self, job_id: str):
 
     except DownloadJob.DoesNotExist:
         logger.warning("Job %s does not exist", job_id)
+        return
+
+    # Hard cancellation before doing any work
+    if is_cancelled(job.id):
+        logger.info("Job %s cancelled before execution", job.id)
         return
 
     proxy = None
@@ -184,6 +203,13 @@ def process_download_job(self, job_id: str):
 
         # Progress hook
         def on_progress(percent: float):
+            if is_cancelled(job.id):
+                logger.warning(
+                    "Job %s cancelled during download",
+                    job.id,
+                )
+                raise DownloadError("JOB_CANCELLED")
+
             job.update_progress(percent)
 
             async_to_sync(channel_layer.group_send)(
@@ -267,8 +293,26 @@ def process_download_job(self, job_id: str):
             error_message=error_message,
         )
 
-    except DownloadError:
-        # handled by autoretry_for
+    except DownloadError as exc:
+        # Cancellation is treated as a clean terminal state
+        if str(exc) == "JOB_CANCELLED":
+            logger.info("Job %s cancelled cleanly", job.id)
+
+            async_to_sync(channel_layer.group_send)(
+                f"job_{job.id}",
+                {
+                    "type": "job_progress",
+                    "data": {
+                        "job_id": str(job.id),
+                        "status": JobStatus.CANCELLED,
+                        "progress": job.progress_percentage,
+                        "terminal": True,
+                    },
+                },
+            )
+            return
+
+        # otherwise handled by autoretry_for
         raise
 
     # Unexpected failures
