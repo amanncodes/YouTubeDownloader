@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from typing import Optional
 
 from celery import shared_task
 from django.db import transaction
@@ -22,19 +23,30 @@ from infrastructure.cookie_vault import CookieVault
 logger = logging.getLogger(__name__)
 channel_layer = get_channel_layer()
 
-
 # Helpers
-def sanitize_error_message(message: str | None, max_length: int: 200) -> str:
+def sanitize_error_message(message: Optional[str], max_length: int = 200) -> str:
     """
-    Sanitize error messages before exposing them to websocker clients.
-    Prevents leaking stack straces, cookies, proxies or internal details.
+    Sanitize error messages before exposing them to WebSocket clients.
+    Prevents leaking stack traces, cookies, proxies, or internal details.
     """
-
     if not message:
         return "An unknown error occurred."
 
     clean = " ".join(str(message).split())
     return clean[:max_length]
+
+
+def get_retry_metadata(job: DownloadJob) -> dict:
+    """
+    Build retry-related metadata for WebSocket payloads.
+    """
+    return {
+        "can_retry": job.can_retry(),
+        "retry_count": job.retry_count,
+        "max_retries": job.MAX_RETRIES,
+        # Hint for UI – approximate Celery backoff
+        "retry_after_seconds": (2 ** job.retry_count) if job.can_retry() else None,
+    }
 
 # Infrastructure (worker-local singletons)
 PROXY_POOL = ProxyPool(
@@ -74,7 +86,7 @@ def process_collection_job(self, parent_job_id: str):
     except Exception as exc:
         parent.mark_failed(
             error_code="DISCOVERY_FAILED",
-            error_message=str(exc),
+            error_message=sanitize_error_message(str(exc)),
         )
         return
 
@@ -222,6 +234,9 @@ def process_download_job(self, job_id: str):
     # Controlled failures
     except MetadataExtractionError as exc:
         reason = str(exc)
+        error_code = "METADATA_EXTRACTION_FAILED"
+        error_message = sanitize_error_message(reason)
+        retry_meta = get_retry_metadata(job)
 
         if reason == "PROXY_FAILED" and proxy:
             PROXY_POOL.report_failure(proxy)
@@ -230,8 +245,6 @@ def process_download_job(self, job_id: str):
         if reason == "COOKIE_INVALID" and cookie_path:
             COOKIE_VAULT.report_failure(cookie_path)
             raise self.retry(exc=exc)
-
-        error_code = "METADATA_EXTRACTION_FAILED"
 
         async_to_sync(channel_layer.group_send)(
             f"job_{job.id}",
@@ -243,13 +256,15 @@ def process_download_job(self, job_id: str):
                     "progress": job.progress_percentage,
                     "terminal": True,
                     "error_code": error_code,
+                    "error_message": error_message,
+                    **retry_meta,
                 },
             },
         )
 
         job.mark_failed(
             error_code=error_code,
-            error_message=reason,
+            error_message=error_message,
         )
 
     except DownloadError:
@@ -260,12 +275,14 @@ def process_download_job(self, job_id: str):
     except Exception as exc:
         logger.exception("Unexpected failure for job %s", job.id)
 
+        error_code = "UNEXPECTED_ERROR"
+        error_message = sanitize_error_message(str(exc))
+        retry_meta = get_retry_metadata(job)
+
         if proxy:
             PROXY_POOL.report_failure(proxy)
         if cookie_path:
             COOKIE_VAULT.report_failure(cookie_path)
-
-        error_code = "UNEXPECTED_ERROR"
 
         async_to_sync(channel_layer.group_send)(
             f"job_{job.id}",
@@ -277,11 +294,13 @@ def process_download_job(self, job_id: str):
                     "progress": job.progress_percentage,
                     "terminal": True,
                     "error_code": error_code,
+                    "error_message": error_message,
+                    **retry_meta,
                 },
             },
         )
 
         job.mark_failed(
             error_code=error_code,
-            error_message=str(exc),
+            error_message=error_message,
         )
