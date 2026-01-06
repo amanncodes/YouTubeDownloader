@@ -100,3 +100,45 @@ class RetryJobAPIView(APIView):
             },
             status=status.HTTP_202_ACCEPTED,
         )
+
+class CancelJobAPIView(APIView):
+    """
+    Cancel a running or pending job.
+    """
+
+    def post(self, request, job_id):
+        try:
+            with transaction.atomic():
+                job = (
+                    DownloadJob.objects
+                    .select_for_update()
+                    .get(id=job_id)
+                )
+
+                if job.status in {
+                    JobStatus.COMPLETED,
+                    JobStatus.FAILED,
+                    JobStatus.CANCELLED,
+                }:
+                    return Response(
+                        {"detail": "Job is already in a terminal state"},
+                        status=status.HTTP_409_CONFLICT,
+                    )
+
+                job.status = JobStatus.CANCELLED
+                job.save(update_fileds=["status"])
+
+        except DownloadJob.DoesnNotExist:
+            return Response(
+                {"detail": "Job not found"},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        return Response(
+            {
+                "id": str(job.id),
+                "status": job.status,
+                "message": "Job cancellation requested",
+            },
+            status=status.HTTP_202_ACCEPTED,
+        )

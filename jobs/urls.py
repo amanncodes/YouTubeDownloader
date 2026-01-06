@@ -15,4 +15,5 @@ urlpatterns = [
 
     # Actions
     path("jobs/<uuid:job_id>/retry/", RetryJobAPIView.as_view()),
+    path("jobs/<uuid:job_id>/cancel/", CancelJobAPIView.as_view()),
 ]

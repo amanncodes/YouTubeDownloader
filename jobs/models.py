@@ -16,6 +16,7 @@ class JobStatus(models.TextChoices):
     UPLOADING = "UPLOADING", "Uploading"
     COMPLETED = "COMPLETED", "Completed"
     FAILED = "FAILED", "Failed"
+    CANCELLED = "CANCELLED", "Cancelled"
 
 
 class JobType(models.TextChoices):
@@ -158,7 +159,10 @@ class DownloadJob(models.Model):
     # Retry & DAG logic
 
     def can_retry(self) -> bool:
-        return self.retry_count < self.max_retries
+        return (
+            self.status == JobStatus.FAILED
+            and self.retry_count < self.MAX_RETRIES
+        )
 
     def increment_retry(self):
         self.retry_count += 1
