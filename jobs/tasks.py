@@ -217,6 +217,8 @@ def process_download_job(self, job_id: str):
             COOKIE_VAULT.report_failure(cookie_path)
             raise self.retry(exc=exc)
 
+        error_code = "METADATA_EXTRACTION_FAILED"
+
         async_to_sync(channel_layer.group_send)(
             f"job_{job.id}",
             {
@@ -226,12 +228,13 @@ def process_download_job(self, job_id: str):
                     "status": JobStatus.FAILED,
                     "progress": job.progress_percentage,
                     "terminal": True,
+                    "error_code": error_code,
                 },
             },
         )
 
         job.mark_failed(
-            error_code="METADATA_EXTRACTION_FAILED",
+            error_code=error_code,
             error_message=reason,
         )
 
@@ -248,6 +251,8 @@ def process_download_job(self, job_id: str):
         if cookie_path:
             COOKIE_VAULT.report_failure(cookie_path)
 
+        error_code = "UNEXPECTED_ERROR"
+
         async_to_sync(channel_layer.group_send)(
             f"job_{job.id}",
             {
@@ -257,11 +262,12 @@ def process_download_job(self, job_id: str):
                     "status": JobStatus.FAILED,
                     "progress": job.progress_percentage,
                     "terminal": True,
+                    "error_code": error_code,
                 },
             },
         )
 
         job.mark_failed(
-            error_code="UNEXPECTED_ERROR",
+            error_code=error_code,
             error_message=str(exc),
         )
