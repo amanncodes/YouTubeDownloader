@@ -24,7 +24,6 @@ class DownloadJobCreateAPIView(generics.CreateAPIView):
 
         job = serializer.save(status=JobStatus.PENDING)
 
-        # Enqueue async task
         if job.job_type in ("PLAYLIST", "CHANNEL"):
             process_collection_job.delay(str(job.id))
         else:
@@ -48,7 +47,7 @@ class DownloadJobDetailAPIView(generics.RetrieveAPIView):
 
 class RetryJobAPIView(APIView):
     """
-    Retry a FAILED job if retry eligibility allows it.
+    Retry a FAILED job if eligible.
     """
 
     def post(self, request, job_id):
@@ -62,48 +61,42 @@ class RetryJobAPIView(APIView):
 
                 if job.status != JobStatus.FAILED:
                     return Response(
-                        {"detail": "Job is not in FAILED state"},
+                        {"detail": "Job is not in FAILED state."},
                         status=status.HTTP_409_CONFLICT,
                     )
 
                 if not job.can_retry():
                     return Response(
-                        {"detail": "Job is not retryable"},
+                        {"detail": "Job is not retryable."},
                         status=status.HTTP_400_BAD_REQUEST,
                     )
 
-                # Reset state for retry
                 job.status = JobStatus.PENDING
                 job.progress_percentage = 0.0
-                job.save(
-                    update_fields=["status", "progress_percentage"]
-                )
+                job.save(update_fields=["status", "progress_percentage"])
 
         except DownloadJob.DoesNotExist:
             return Response(
-                {"detail": "Job not found"},
+                {"detail": "Job not found."},
                 status=status.HTTP_404_NOT_FOUND,
             )
 
-        # Re-enqueue task (outside transaction)
-        if job.job_type in ("PLAYLIST", "CHANNEL"):
-            process_collection_job.delay(str(job.id))
-        else:
-            process_download_job.delay(str(job.id))
-
-        serializer = RetryJobResponseSerializer(job)
+        process_download_job.delay(str(job.id))
 
         return Response(
             {
-                **serializer.data,
+                "id": job.id,
+                "status": job.status,
+                "retry_count": job.retry_count,
                 "message": "Job scheduled for retry",
             },
             status=status.HTTP_202_ACCEPTED,
         )
 
-class CancelJobAPIView(APIView):
+
+class PauseJobAPIView(APIView):
     """
-    Cancel a running or pending job.
+    Pause a running job (cooperative).
     """
 
     def post(self, request, job_id):
@@ -115,30 +108,65 @@ class CancelJobAPIView(APIView):
                     .get(id=job_id)
                 )
 
-                if job.status in {
-                    JobStatus.COMPLETED,
-                    JobStatus.FAILED,
-                    JobStatus.CANCELLED,
-                }:
+                if job.status != JobStatus.DOWNLOADING:
                     return Response(
-                        {"detail": "Job is already in a terminal state"},
+                        {"detail": "Only DOWNLOADING jobs can be paused."},
                         status=status.HTTP_409_CONFLICT,
                     )
 
-                job.status = JobStatus.CANCELLED
-                job.save(update_fileds=["status"])
+                job.update_status(JobStatus.PAUSED)
 
-        except DownloadJob.DoesnNotExist:
+        except DownloadJob.DoesNotExist:
             return Response(
-                {"detail": "Job not found"},
+                {"detail": "Job not found."},
                 status=status.HTTP_404_NOT_FOUND,
             )
 
         return Response(
             {
-                "id": str(job.id),
+                "id": job.id,
                 "status": job.status,
-                "message": "Job cancellation requested",
+                "message": "Job paused successfully.",
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class ResumeJobAPIView(APIView):
+    """
+    Resume a paused job.
+    """
+
+    def post(self, request, job_id):
+        try:
+            with transaction.atomic():
+                job = (
+                    DownloadJob.objects
+                    .select_for_update()
+                    .get(id=job_id)
+                )
+
+                if job.status != JobStatus.PAUSED:
+                    return Response(
+                        {"detail": "Only PAUSED jobs can be resumed."},
+                        status=status.HTTP_409_CONFLICT,
+                    )
+
+                job.update_status(JobStatus.PENDING)
+
+        except DownloadJob.DoesNotExist:
+            return Response(
+                {"detail": "Job not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        process_download_job.delay(str(job.id))
+
+        return Response(
+            {
+                "id": job.id,
+                "status": job.status,
+                "message": "Job resumed successfully.",
             },
             status=status.HTTP_202_ACCEPTED,
         )

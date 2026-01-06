@@ -9,14 +9,15 @@ class JobStatus(models.TextChoices):
     A job MUST always be in exactly one of these states.
     """
     PENDING = "PENDING", "Pending"
-    QUEUED = "QUEUED", "Queued"
-    FETCHING_METADATA = "FETCHING_METADATA", "Fetching Metadata"
+    DISCOVERING = "DISCOVERING", "Discovering"
+    FETCHING_METADATA = "FETCHING_METADATA", "Fetching metadata"
     DOWNLOADING = "DOWNLOADING", "Downloading"
-    MUXING = "MUXING", "Muxing"
-    UPLOADING = "UPLOADING", "Uploading"
+
+    PAUSED = "PAUSED", "Paused"
+    CANCELLED = "CANCELLED", "Cancelled"
+
     COMPLETED = "COMPLETED", "Completed"
     FAILED = "FAILED", "Failed"
-    CANCELLED = "CANCELLED", "Cancelled"
 
 
 class JobType(models.TextChoices):
@@ -36,6 +37,9 @@ class DownloadJob(models.Model):
     This model is the source of truth.
     Celery tasks are ephemeral; jobs are durable.
     """
+
+    MAX_RETRIES = 3
+    RETRY_BACKOFF_BASE = 2
 
     id = models.UUIDField(
         primary_key=True,

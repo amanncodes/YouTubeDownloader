@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import shutil
 from typing import Optional
 
 from celery import shared_task
@@ -10,6 +11,7 @@ from asgiref.sync import async_to_sync
 from channels.layers import get_channel_layer
 
 from jobs.models import DownloadJob, JobStatus
+from jobs.cleanup import cleanup_job_files
 from media.models import VideoMetadata
 from media_engine.discovery import DiscoveryEngine
 from media_engine.yt_dlp_wrapper import (
@@ -17,73 +19,72 @@ from media_engine.yt_dlp_wrapper import (
     MetadataExtractionError,
     DownloadError,
 )
-from infrastructure.proxy_pool import Proxy, ProxyPool
-from infrastructure.cookie_vault import CookieVault
 
 logger = logging.getLogger(__name__)
 channel_layer = get_channel_layer()
 
+TMP_DIR = "tmp_downloads"
+
+
+# ─────────────────────────────────────────────────────────────
 # Helpers
-def sanitize_error_message(message: Optional[str], max_length: int = 200) -> str:
-    """
-    Sanitize error messages before exposing them to WebSocket clients.
-    Prevents leaking stack traces, cookies, proxies, or internal details.
-    """
+# ─────────────────────────────────────────────────────────────
+
+def sanitize_error_message(
+    message: Optional[str],
+    max_length: int = 200,
+) -> str:
     if not message:
         return "An unknown error occurred."
-
-    clean = " ".join(str(message).split())
-    return clean[:max_length]
+    return " ".join(str(message).split())[:max_length]
 
 
 def get_retry_metadata(job: DownloadJob) -> dict:
-    """
-    Build retry-related metadata for WebSocket payloads.
-    """
     return {
         "can_retry": job.can_retry(),
         "retry_count": job.retry_count,
-        "max_retries": job.MAX_RETRIES,
-        # Hint for UI – approximate Celery backoff
-        "retry_after_seconds": (2 ** job.retry_count)
-        if job.can_retry()
-        else None,
+        "retry_after_seconds": (
+            2 ** job.retry_count if job.can_retry() else None
+        ),
     }
 
 
-def is_cancelled(job_id: str) -> bool:
+def get_current_status(job_id: str) -> Optional[str]:
     return (
         DownloadJob.objects
-        .filter(id=job_id, status=JobStatus.CANCELLED)
-        .exists()
+        .filter(id=job_id)
+        .values_list("status", flat=True)
+        .first()
     )
 
-# Infrastructure (worker-local singletons)
-PROXY_POOL = ProxyPool(
-    proxies=[
-        Proxy("http://1.2.3.4:8000", "datacenter"),
-        Proxy("http://5.6.7.8:8000", "residential"),
-    ],
-    max_failures=3,
-    cooldown_seconds=300,
-)
 
-COOKIE_VAULT = CookieVault(
-    cookie_files=[
-        "cookies/a.txt",
-        "cookies/b.txt",
-    ],
-    max_failures=2,
-    cooldown_seconds=600,
-)
+def disk_pressure_exceeded(
+    path: str = TMP_DIR,
+    threshold: float = 0.9,
+) -> bool:
+    total, used, _ = shutil.disk_usage(path)
+    return (used / total) >= threshold
 
-# COLLECTION TASK (playlist / channel fan-out)
+
+def emit_ws(job: DownloadJob, payload: dict) -> None:
+    async_to_sync(channel_layer.group_send)(
+        f"job_{job.id}",
+        {
+            "type": "job_progress",
+            "data": payload,
+        },
+    )
+
+
+# ─────────────────────────────────────────────────────────────
+# COLLECTION TASK
+# ─────────────────────────────────────────────────────────────
+
 @shared_task(bind=True, acks_late=True)
 def process_collection_job(self, parent_job_id: str):
     try:
         parent = DownloadJob.objects.get(id=parent_job_id)
     except DownloadJob.DoesNotExist:
-        logger.warning("Parent job %s does not exist", parent_job_id)
         return
 
     if parent.status != JobStatus.PENDING:
@@ -92,7 +93,7 @@ def process_collection_job(self, parent_job_id: str):
     parent.update_status(JobStatus.DISCOVERING)
 
     try:
-        video_urls = DiscoveryEngine.extract_video_urls(parent.source_url)
+        urls = DiscoveryEngine.extract_video_urls(parent.source_url)
     except Exception as exc:
         parent.mark_failed(
             error_code="DISCOVERY_FAILED",
@@ -100,7 +101,7 @@ def process_collection_job(self, parent_job_id: str):
         )
         return
 
-    if not video_urls:
+    if not urls:
         parent.mark_failed(
             error_code="EMPTY_COLLECTION",
             error_message="No videos found",
@@ -113,7 +114,7 @@ def process_collection_job(self, parent_job_id: str):
             source_url=url,
             parent=parent,
         )
-        for url in video_urls
+        for url in urls
     ]
 
     parent.total_children = len(children)
@@ -123,13 +124,11 @@ def process_collection_job(self, parent_job_id: str):
     for child in children:
         process_download_job.delay(str(child.id))
 
-    logger.info(
-        "Parent job %s spawned %d child jobs",
-        parent.id,
-        len(children),
-    )
 
-# VIDEO DOWNLOAD TASK
+# ─────────────────────────────────────────────────────────────
+# VIDEO TASK
+# ─────────────────────────────────────────────────────────────
+
 @shared_task(
     bind=True,
     acks_late=True,
@@ -154,38 +153,46 @@ def process_download_job(self, job_id: str):
             }:
                 return
 
+            # ─── DISK PRESSURE GUARD (REAL) ───
+            if disk_pressure_exceeded():
+                job.mark_failed(
+                    error_code="DISK_FULL",
+                    error_message="Server disk usage exceeded safe limit",
+                )
+
+                emit_ws(
+                    job,
+                    {
+                        "job_id": str(job.id),
+                        "status": JobStatus.FAILED,
+                        "terminal": True,
+                        "error_code": "DISK_FULL",
+                        "error_message": "Server disk usage exceeded safe limit",
+                        "can_retry": False,
+                    },
+                )
+
+                cleanup_job_files(str(job.id))
+                return
+
             job.mark_started()
             job.update_status(JobStatus.FETCHING_METADATA)
 
     except DownloadJob.DoesNotExist:
-        logger.warning("Job %s does not exist", job_id)
         return
 
-    # Hard cancellation before doing any work
-    if is_cancelled(job.id):
-        logger.info("Job %s cancelled before execution", job.id)
-        return
-
-    proxy = None
-    cookie_path = None
+    engine = YtDlpEngine(
+        work_dir=TMP_DIR,
+        proxy=None,
+        cookie_file=None,
+    )
 
     try:
-        # Acquire identity
-        proxy = PROXY_POOL.get_proxy(proxy_type="datacenter")
-        cookie_path = COOKIE_VAULT.get_cookie()
-
-        engine = YtDlpEngine(
-            work_dir="tmp_downloads",
-            proxy=proxy,
-            cookie_file=str(cookie_path) if cookie_path else None,
-        )
-
-        # Metadata
+        # ─── METADATA ───
         metadata = engine.extract_metadata(job.source_url)
-        youtube_id = metadata.get("id")
 
         VideoMetadata.objects.update_or_create(
-            youtube_id=youtube_id,
+            youtube_id=metadata.get("id"),
             defaults={
                 "job": job,
                 "title": metadata.get("title"),
@@ -201,150 +208,121 @@ def process_download_job(self, job_id: str):
 
         job.update_status(JobStatus.DOWNLOADING)
 
-        # Progress hook
+        # ─── PROGRESS HOOK ───
         def on_progress(percent: float):
-            if is_cancelled(job.id):
-                logger.warning(
-                    "Job %s cancelled during download",
-                    job.id,
-                )
+            status = get_current_status(job.id)
+
+            if status == JobStatus.PAUSED:
+                raise DownloadError("JOB_PAUSED")
+
+            if status == JobStatus.CANCELLED:
                 raise DownloadError("JOB_CANCELLED")
 
             job.update_progress(percent)
 
-            async_to_sync(channel_layer.group_send)(
-                f"job_{job.id}",
+            emit_ws(
+                job,
                 {
-                    "type": "job_progress",
-                    "data": {
-                        "job_id": str(job.id),
-                        "status": JobStatus.DOWNLOADING,
-                        "progress": percent,
-                    },
+                    "job_id": str(job.id),
+                    "status": JobStatus.DOWNLOADING,
+                    "progress": percent,
                 },
             )
 
-            if job.parent:
-                job.parent.recompute_parent_progress()
-
-        # Download
+        # ─── DOWNLOAD ───
         engine.download(
             job.source_url,
             progress_callback=on_progress,
         )
 
-        # Success handling
-        if proxy:
-            PROXY_POOL.report_success(proxy)
-        if cookie_path:
-            COOKIE_VAULT.report_success(cookie_path)
-
+        # ─── SUCCESS ───
         job.mark_completed()
 
-        async_to_sync(channel_layer.group_send)(
-            f"job_{job.id}",
+        emit_ws(
+            job,
             {
-                "type": "job_progress",
-                "data": {
-                    "job_id": str(job.id),
-                    "status": JobStatus.COMPLETED,
-                    "progress": 100.0,
-                    "terminal": True,
-                },
+                "job_id": str(job.id),
+                "status": JobStatus.COMPLETED,
+                "progress": 100.0,
+                "terminal": True,
             },
         )
 
-        if job.parent:
-            job.parent.recompute_parent_progress()
-
-    # Controlled failures
-    except MetadataExtractionError as exc:
+    # ─────────────────────────────
+    # PAUSE / CANCEL
+    # ─────────────────────────────
+    except DownloadError as exc:
         reason = str(exc)
-        error_code = "METADATA_EXTRACTION_FAILED"
-        error_message = sanitize_error_message(reason)
-        retry_meta = get_retry_metadata(job)
 
-        if reason == "PROXY_FAILED" and proxy:
-            PROXY_POOL.report_failure(proxy)
-            raise self.retry(exc=exc)
+        if reason == "JOB_PAUSED":
+            job.update_status(JobStatus.PAUSED)
 
-        if reason == "COOKIE_INVALID" and cookie_path:
-            COOKIE_VAULT.report_failure(cookie_path)
-            raise self.retry(exc=exc)
-
-        async_to_sync(channel_layer.group_send)(
-            f"job_{job.id}",
-            {
-                "type": "job_progress",
-                "data": {
+            emit_ws(
+                job,
+                {
                     "job_id": str(job.id),
-                    "status": JobStatus.FAILED,
+                    "status": JobStatus.PAUSED,
                     "progress": job.progress_percentage,
                     "terminal": True,
-                    "error_code": error_code,
-                    "error_message": error_message,
-                    **retry_meta,
-                },
-            },
-        )
-
-        job.mark_failed(
-            error_code=error_code,
-            error_message=error_message,
-        )
-
-    except DownloadError as exc:
-        # Cancellation is treated as a clean terminal state
-        if str(exc) == "JOB_CANCELLED":
-            logger.info("Job %s cancelled cleanly", job.id)
-
-            async_to_sync(channel_layer.group_send)(
-                f"job_{job.id}",
-                {
-                    "type": "job_progress",
-                    "data": {
-                        "job_id": str(job.id),
-                        "status": JobStatus.CANCELLED,
-                        "progress": job.progress_percentage,
-                        "terminal": True,
-                    },
+                    "can_resume": True,
                 },
             )
             return
 
-        # otherwise handled by autoretry_for
+        if reason == "JOB_CANCELLED":
+            job.mark_cancelled()
+            cleanup_job_files(str(job.id))
+            return
+
         raise
 
-    # Unexpected failures
-    except Exception as exc:
-        logger.exception("Unexpected failure for job %s", job.id)
-
-        error_code = "UNEXPECTED_ERROR"
+    # ─────────────────────────────
+    # METADATA FAILURE
+    # ─────────────────────────────
+    except MetadataExtractionError as exc:
         error_message = sanitize_error_message(str(exc))
         retry_meta = get_retry_metadata(job)
 
-        if proxy:
-            PROXY_POOL.report_failure(proxy)
-        if cookie_path:
-            COOKIE_VAULT.report_failure(cookie_path)
-
-        async_to_sync(channel_layer.group_send)(
-            f"job_{job.id}",
+        emit_ws(
+            job,
             {
-                "type": "job_progress",
-                "data": {
-                    "job_id": str(job.id),
-                    "status": JobStatus.FAILED,
-                    "progress": job.progress_percentage,
-                    "terminal": True,
-                    "error_code": error_code,
-                    "error_message": error_message,
-                    **retry_meta,
-                },
+                "job_id": str(job.id),
+                "status": JobStatus.FAILED,
+                "terminal": True,
+                "error_code": "METADATA_EXTRACTION_FAILED",
+                "error_message": error_message,
+                **retry_meta,
             },
         )
 
         job.mark_failed(
-            error_code=error_code,
+            error_code="METADATA_EXTRACTION_FAILED",
             error_message=error_message,
         )
+
+    # ─────────────────────────────
+    # UNEXPECTED FAILURE
+    # ─────────────────────────────
+    except Exception as exc:
+        logger.exception("Unexpected failure for job %s", job.id)
+
+        error_message = sanitize_error_message(str(exc))
+        retry_meta = get_retry_metadata(job)
+
+        emit_ws(
+            job,
+            {
+                "job_id": str(job.id),
+                "status": JobStatus.FAILED,
+                "terminal": True,
+                "error_code": "UNEXPECTED_ERROR",
+                "error_message": error_message,
+                **retry_meta,
+            },
+        )
+
+        job.mark_failed(
+            error_code="UNEXPECTED_ERROR",
+            error_message=error_message,
+        )
+        cleanup_job_files(str(job.id))
