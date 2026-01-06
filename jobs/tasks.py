@@ -22,6 +22,20 @@ from infrastructure.cookie_vault import CookieVault
 logger = logging.getLogger(__name__)
 channel_layer = get_channel_layer()
 
+
+# Helpers
+def sanitize_error_message(message: str | None, max_length: int: 200) -> str:
+    """
+    Sanitize error messages before exposing them to websocker clients.
+    Prevents leaking stack straces, cookies, proxies or internal details.
+    """
+
+    if not message:
+        return "An unknown error occurred."
+
+    clean = " ".join(str(message).split())
+    return clean[:max_length]
+
 # Infrastructure (worker-local singletons)
 PROXY_POOL = ProxyPool(
     proxies=[
